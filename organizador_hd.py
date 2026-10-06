@@ -34,7 +34,45 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".o
 DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".rtf", ".odt", ".ods", ".odp"}
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso"}
 EXECUTABLE_EXTENSIONS = {".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".jar"}
-SKIP_DIR_NAMES = {"_organizador_hd_quarentena", ".organizador_hd"}
+SKIP_DIR_NAMES = {
+    "_organizador_hd_quarentena",
+    ".organizador_hd",
+    # Controle de versão
+    ".git",
+    ".hg",
+    ".svn",
+    # JavaScript / Node
+    "node_modules",
+    "bower_components",
+    ".npm",
+    ".yarn",
+    ".pnpm-store",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".parcel-cache",
+    # PHP / Composer
+    "vendor",
+    ".composer",
+    # Python
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    # Java / Gradle / Maven
+    ".gradle",
+    ".m2",
+    # Rust / Dart / iOS
+    ".cargo",
+    "target",
+    ".dart_tool",
+    ".pub-cache",
+    "pods",
+}
 
 
 def now_iso() -> str:
