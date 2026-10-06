@@ -474,6 +474,8 @@ class OrganizadorApp:
         self.total_scanned = 0
         self.total_indexed = 0
         self.started_at = 0.0
+        self.folder_usage_path = ""
+        self.folder_usage_data: dict[str, dict] = {}
 
         self.path_var = StringVar()
         self.search_var = StringVar()
@@ -539,14 +541,17 @@ class OrganizadorApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=BOTH, expand=True, padx=18, pady=(0, 8))
         self.files_tab = ttk.Frame(self.notebook, padding=8)
+        self.folder_usage_tab = ttk.Frame(self.notebook, padding=8)
         self.duplicates_tab = ttk.Frame(self.notebook, padding=8)
         self.similar_tab = ttk.Frame(self.notebook, padding=8)
         self.quarantine_tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(self.files_tab, text="Arquivos")
+        self.notebook.add(self.folder_usage_tab, text="Uso por pasta")
         self.notebook.add(self.duplicates_tab, text="Duplicados exatos")
         self.notebook.add(self.similar_tab, text="Nomes similares")
         self.notebook.add(self.quarantine_tab, text="Quarentena / restauração")
         self.build_files_tab()
+        self.build_folder_usage_tab()
         self.build_duplicates_tab()
         self.build_similar_tab()
         self.build_quarantine_tab()
@@ -580,6 +585,191 @@ class OrganizadorApp:
         scroll_y.pack(side=RIGHT, fill=Y)
         scroll_x.pack(side=BOTTOM, fill=X)
         self.files_tree.bind("<Double-1>", lambda _event: self.open_selected_folder())
+
+    def build_folder_usage_tab(self) -> None:
+        actions = ttk.Frame(self.folder_usage_tab)
+        actions.pack(fill=X, pady=(0, 8))
+        ttk.Button(actions, text="Medir raiz analisada", style="Primary.TButton", command=self.reset_folder_usage).pack(side=LEFT)
+        ttk.Button(actions, text="Subir um nível", command=self.folder_usage_parent).pack(side=LEFT, padx=6)
+        ttk.Button(actions, text="Entrar na pasta", command=self.enter_selected_folder_usage).pack(side=LEFT)
+        ttk.Button(actions, text="Abrir no Explorer", command=self.open_folder_usage_path).pack(side=LEFT, padx=6)
+        ttk.Label(actions, text="Somente leitura: mede o tamanho real sem adicionar os arquivos ao índice principal.", style="Sub.TLabel").pack(side=RIGHT)
+
+        self.folder_usage_path_var = StringVar(value="Nenhuma pasta medida")
+        ttk.Label(self.folder_usage_tab, textvariable=self.folder_usage_path_var, style="Sub.TLabel").pack(fill=X, pady=(0, 8))
+
+        columns = [
+            ("name", "Nome", 330),
+            ("kind", "Tipo", 150),
+            ("size", "Tamanho", 125),
+            ("files", "Arquivos", 90),
+            ("dirs", "Subpastas", 90),
+            ("path", "Caminho", 560),
+        ]
+        tree_frame = ttk.Frame(self.folder_usage_tab)
+        tree_frame.pack(fill=BOTH, expand=True)
+        self.folder_usage_tree = ttk.Treeview(tree_frame, columns=[x[0] for x in columns], show="headings", selectmode="browse")
+        for key, title, width in columns:
+            self.folder_usage_tree.heading(key, text=title)
+            self.folder_usage_tree.column(key, width=width, minwidth=70, anchor="w")
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.folder_usage_tree.yview)
+        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.folder_usage_tree.xview)
+        self.folder_usage_tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self.folder_usage_tree.grid(row=0, column=0, sticky="nsew")
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.folder_usage_tree.bind("<Double-1>", lambda _event: self.enter_selected_folder_usage())
+
+    def reset_folder_usage(self) -> None:
+        if not self.root_path or not Path(self.root_path).is_dir():
+            messagebox.showinfo(APP_NAME, "Escolha uma pasta válida primeiro.")
+            return
+        self.start_folder_usage(self.root_path)
+
+    def start_folder_usage(self, path: str | None = None) -> None:
+        if not self.root_path or not Path(self.root_path).is_dir():
+            messagebox.showinfo(APP_NAME, "Escolha uma pasta válida primeiro.")
+            return
+        if self.worker and self.worker.is_alive():
+            return
+        root = Path(self.root_path).resolve()
+        target = Path(path or self.folder_usage_path or self.root_path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            target = root
+        if not target.is_dir():
+            messagebox.showwarning(APP_NAME, "A pasta selecionada não está mais disponível.")
+            return
+
+        self.folder_usage_path = str(target)
+        self.folder_usage_path_var.set(f"Medindo: {self.folder_usage_path}")
+        self.folder_usage_data = {}
+        for item in self.folder_usage_tree.get_children():
+            self.folder_usage_tree.delete(item)
+
+        self.cancel_event.clear()
+        self.scan_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.progress.stop()
+        self.progress.configure(value=0, mode="determinate")
+        self.status_var.set(f"Calculando uso de disco em {target}…")
+        self.worker = threading.Thread(target=self.folder_usage_worker, args=(str(target),), daemon=True)
+        self.worker.start()
+
+    def folder_usage_worker(self, root: str) -> None:
+        try:
+            target = Path(root)
+            rows: list[dict] = []
+            inaccessible = 0
+            try:
+                with os.scandir(target) as iterator:
+                    entries = list(iterator)
+            except (OSError, PermissionError) as exc:
+                self.events.put(("error", f"Não foi possível ler a pasta: {exc}"))
+                return
+
+            total = len(entries)
+            for index, entry in enumerate(entries, 1):
+                if self.cancel_event.is_set():
+                    break
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        stat = entry.stat(follow_symlinks=False)
+                        kind = "Arquivo do sistema" if entry.name.lower() in {"pagefile.sys", "hiberfil.sys", "swapfile.sys"} else "Arquivo"
+                        rows.append({
+                            "name": entry.name,
+                            "kind": kind,
+                            "size": int(stat.st_size),
+                            "files": 1,
+                            "dirs": 0,
+                            "path": entry.path,
+                            "is_dir": False,
+                        })
+                    elif entry.is_dir(follow_symlinks=False):
+                        size, files, dirs, errors = self.measure_directory_usage(Path(entry.path))
+                        inaccessible += errors
+                        kind = "Dependência/cache" if entry.name.lower() in SKIP_DIR_NAMES else "Pasta"
+                        rows.append({
+                            "name": entry.name,
+                            "kind": kind,
+                            "size": size,
+                            "files": files,
+                            "dirs": dirs,
+                            "path": entry.path,
+                            "is_dir": True,
+                        })
+                except (OSError, PermissionError):
+                    inaccessible += 1
+                self.events.put(("folder_usage_progress", index, total, entry.name))
+
+            rows.sort(key=lambda row: (-int(row["size"]), row["name"].lower()))
+            self.events.put(("folder_usage_done", root, rows, self.cancel_event.is_set(), inaccessible))
+        except Exception as exc:
+            self.events.put(("error", f"Falha ao calcular uso por pasta: {exc}"))
+
+    def measure_directory_usage(self, root: Path) -> tuple[int, int, int, int]:
+        total_size = 0
+        file_count = 0
+        dir_count = 0
+        errors = 0
+        stack = [root]
+        while stack and not self.cancel_event.is_set():
+            current = stack.pop()
+            try:
+                with os.scandir(current) as iterator:
+                    for entry in iterator:
+                        if self.cancel_event.is_set():
+                            break
+                        try:
+                            if getattr(entry, "is_junction", lambda: False)():
+                                continue
+                            if entry.is_file(follow_symlinks=False):
+                                total_size += int(entry.stat(follow_symlinks=False).st_size)
+                                file_count += 1
+                            elif entry.is_dir(follow_symlinks=False):
+                                dir_count += 1
+                                stack.append(Path(entry.path))
+                        except (OSError, PermissionError):
+                            errors += 1
+            except (OSError, PermissionError):
+                errors += 1
+        return total_size, file_count, dir_count, errors
+
+    def enter_selected_folder_usage(self) -> None:
+        selected = self.folder_usage_tree.selection()
+        if not selected:
+            return
+        row = self.folder_usage_data.get(selected[0])
+        if not row or not row.get("is_dir"):
+            return
+        self.start_folder_usage(row["path"])
+
+    def folder_usage_parent(self) -> None:
+        if not self.root_path:
+            return
+        root = Path(self.root_path).resolve()
+        current = Path(self.folder_usage_path or self.root_path).resolve()
+        if current == root:
+            return
+        parent = current.parent
+        try:
+            parent.relative_to(root)
+        except ValueError:
+            parent = root
+        self.start_folder_usage(str(parent))
+
+    def open_folder_usage_path(self) -> None:
+        selected = self.folder_usage_tree.selection()
+        row = self.folder_usage_data.get(selected[0]) if selected else None
+        path = Path(row["path"]) if row else Path(self.folder_usage_path or self.root_path)
+        folder = path if path.is_dir() else path.parent
+        try:
+            os.startfile(str(folder))
+        except (AttributeError, OSError) as exc:
+            messagebox.showerror(APP_NAME, f"Não foi possível abrir a pasta: {exc}")
 
     def build_duplicates_tab(self) -> None:
         actions = ttk.Frame(self.duplicates_tab)
@@ -639,6 +829,13 @@ class OrganizadorApp:
     def set_root(self, chosen: str) -> None:
         path = str(Path(chosen).resolve())
         self.root_path = path
+        self.folder_usage_path = path
+        if hasattr(self, "folder_usage_path_var"):
+            self.folder_usage_path_var.set(f"Pronto para medir: {path}")
+        if hasattr(self, "folder_usage_tree"):
+            self.folder_usage_data = {}
+            for item in self.folder_usage_tree.get_children():
+                self.folder_usage_tree.delete(item)
         self.path_var.set(path)
         self.refresh_files()
         self.refresh_summary()
@@ -946,6 +1143,37 @@ class OrganizadorApp:
                         self.status_var.set("Miniatura gerada e armazenada no cache.")
                         self.show_thumbnail_preview(Path(thumbnail), Path(path).name)
                     self.refresh_files()
+                elif kind == "folder_usage_progress":
+                    done, total, name = event[1], event[2], event[3]
+                    self.progress.configure(value=(done / total * 100) if total else 100)
+                    self.status_var.set(f"Medindo {done:,}/{total:,}: {name}".replace(",", "."))
+                elif kind == "folder_usage_done":
+                    path, rows, canceled, inaccessible = event[1], event[2], event[3], event[4]
+                    self.scan_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                    self.progress.configure(value=100)
+                    self.folder_usage_path = path
+                    self.folder_usage_path_var.set(f"Uso por pasta: {path}")
+                    self.folder_usage_data = {}
+                    for item in self.folder_usage_tree.get_children():
+                        self.folder_usage_tree.delete(item)
+                    measured_total = 0
+                    for index, row in enumerate(rows):
+                        item_id = f"usage_{index}"
+                        self.folder_usage_data[item_id] = row
+                        measured_total += int(row["size"])
+                        self.folder_usage_tree.insert("", END, iid=item_id, values=(
+                            row["name"],
+                            row["kind"],
+                            format_bytes(row["size"]),
+                            f"{row['files']:,}".replace(",", "."),
+                            f"{row['dirs']:,}".replace(",", "."),
+                            row["path"],
+                        ))
+                    suffix = f" • {inaccessible} item(ns) sem acesso" if inaccessible else ""
+                    state = "Medição interrompida" if canceled else "Medição concluída"
+                    self.status_var.set(f"{state} — {format_bytes(measured_total)} visíveis neste nível{suffix}.")
+                    self.notebook.select(self.folder_usage_tab)
                 elif kind == "error":
                     self.progress.stop()
                     self.scan_button.configure(state="normal")
